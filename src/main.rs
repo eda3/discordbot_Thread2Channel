@@ -1,26 +1,25 @@
 use std::env;
 use std::sync::Arc;
 use dotenv::dotenv;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
 
-use twilight_gateway::{Event, Intents, Shard, ShardId};
+use twilight_gateway::{Event, Intents, Shard, ShardId, StreamExt, EventTypeFlags};
 use twilight_http::Client as HttpClient;
 use twilight_model::gateway::payload::incoming::MessageCreate;
-use twilight_model::id::{ChannelId, GuildId};
-use twilight_model::channel::message::MessageReference;
+use twilight_model::id::{Id, marker::ChannelMarker};
 
 // スレッド情報を保持する構造体
 struct ThreadInfo {
-    target_channel_id: ChannelId,
+    target_channel_id: Id<ChannelMarker>,
 }
 
 // ボットの状態を管理する構造体
 struct BotState {
     http: HttpClient,
     // スレッドID -> ターゲットチャンネルIDのマッピング
-    thread_mappings: HashMap<ChannelId, ThreadInfo>,
+    thread_mappings: HashMap<Id<ChannelMarker>, ThreadInfo>,
 }
 
 impl BotState {
@@ -42,9 +41,9 @@ impl BotState {
                         parts[1].parse::<u64>(),
                     ) {
                         thread_mappings.insert(
-                            ChannelId::new(thread_id),
+                            Id::new(thread_id),
                             ThreadInfo {
-                                target_channel_id: ChannelId::new(target_channel_id),
+                                target_channel_id: Id::new(target_channel_id),
                             },
                         );
                         tracing::info!("Added thread mapping: {} -> {}", thread_id, target_channel_id);
@@ -60,7 +59,7 @@ impl BotState {
     }
 
     // 新しいスレッドマッピングを追加
-    async fn add_thread_mapping(&mut self, thread_id: ChannelId, target_channel_id: ChannelId) {
+    async fn add_thread_mapping(&mut self, thread_id: Id<ChannelMarker>, target_channel_id: Id<ChannelMarker>) {
         self.thread_mappings.insert(
             thread_id,
             ThreadInfo {
@@ -85,13 +84,17 @@ impl BotState {
                 
                 let full_content = format!("{}{}", content, attachment_urls);
                 
-                self.http
+                // 直接メッセージを送信
+                match self.http
                     .create_message(thread_info.target_channel_id)
                     .content(&full_content)
-                    .context("Failed to create message content")?
-                    .exec()
-                    .await
-                    .context("Failed to send message to target channel")?;
+                    .await 
+                {
+                    Ok(_) => {},
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to send message: {}", e));
+                    }
+                }
                 
                 tracing::info!(
                     "Copied message from thread {} to channel {}",
@@ -114,16 +117,16 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     
     // コマンドライン引数の解析
-    let debug_mode = env::args().any(|arg| arg == "--debug");
+    let debug_mode = env::args().any(|arg| arg == "-debug");
     
     // トークンの取得
-    let token = env::var("DISCORD_TOKEN").context("Missing DISCORD_TOKEN environment variable")?;
+    let token = env::var("DISCORD_TOKEN").map_err(|_| anyhow::anyhow!("Missing DISCORD_TOKEN environment variable"))?;
     
     // ボットステートの初期化
     let bot_state = Arc::new(Mutex::new(BotState::new(token.clone())));
     
     // インテント（権限）の設定
-    let intents = Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
+    let intents = Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT | Intents::GUILD_MESSAGE_REACTIONS;
     
     // シャードの作成
     let mut shard = Shard::new(ShardId::ONE, token, intents);
@@ -135,11 +138,15 @@ async fn main() -> Result<()> {
     
     // イベントループ
     loop {
-        let event = match shard.next_event().await {
-            Ok(event) => event,
-            Err(e) => {
+        let event = match shard.next_event(EventTypeFlags::all()).await {
+            Some(Ok(event)) => event,
+            Some(Err(e)) => {
                 tracing::error!("Error receiving event: {}", e);
                 continue;
+            }
+            None => {
+                tracing::warn!("Event stream ended");
+                break;
             }
         };
         
@@ -149,7 +156,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             match event {
                 Event::MessageCreate(msg) => {
-                    if let Err(e) = bot_state_clone.lock().await.handle_message(msg).await {
+                    if let Err(e) = bot_state_clone.lock().await.handle_message(*msg).await {
                         tracing::error!("Error handling message: {}", e);
                     }
                 }
@@ -160,4 +167,6 @@ async fn main() -> Result<()> {
             }
         });
     }
+    
+    Ok(())
 }
