@@ -186,6 +186,7 @@ dependencies = [
  "twilight-gateway",
  "twilight-http",
  "twilight-model",
+ "twilight-util",
 ]
 
 [[package]]
@@ -1258,6 +1259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "twilight-util"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5777d71286611c1639021f5f6e6b40300eb8da278449ac1cf6da01c94053425"
+dependencies = [
+ "twilight-model",
+ "twilight-validate",
+]
+
+[[package]]
 name = "twilight-validate"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1346,7 +1357,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
