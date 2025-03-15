@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 // Discord APIとのインタラクションに必要なクレート
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
@@ -16,12 +17,74 @@ use twilight_model::id::{marker::ChannelMarker, Id};
 
 /// スレッド情報を保持する構造体
 /// 各スレッドがメッセージをコピーする先のターゲットチャンネルIDと転送設定を格納します
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ThreadInfo {
     /// メッセージのコピー先チャンネルID
     target_channel_id: Id<ChannelMarker>,
     /// 過去のメッセージを全て取得して転送するかどうか
     transfer_all_messages: bool,
+}
+
+/// `環境変数のキーが"THREAD_MAPPING_"`で始まるかどうかを判定する関数
+///
+/// # 引数
+/// * `key` - チェックする環境変数キー
+///
+/// # 戻り値
+/// * `bool` - キーがパターンにマッチする場合はtrue
+fn is_thread_mapping_key(key: &str) -> bool {
+    key.starts_with("THREAD_MAPPING_")
+}
+
+/// スレッドマッピング環境変数のデバッグ情報を出力する関数
+///
+/// # 引数
+/// * `key` - 環境変数のキー
+/// * `value` - 環境変数の値
+fn log_thread_mapping_env(key: &str, value: &str) {
+    tracing::debug!("  環境変数: {}={}", key, value);
+}
+
+/// スレッドマッピングの要約情報をログに出力する関数
+///
+/// # 引数
+/// * `mappings` - スレッドマッピングのハッシュマップ
+fn log_thread_mappings_summary(mappings: &HashMap<Id<ChannelMarker>, ThreadInfo>) {
+    tracing::info!("読み込まれたスレッドマッピングの総数: {}", mappings.len());
+
+    // すべてのマッピングを出力
+    for (thread_id, info) in mappings {
+        tracing::info!(
+            "マッピング情報: スレッドID {} -> チャンネルID {}",
+            thread_id,
+            info.target_channel_id
+        );
+    }
+}
+
+/// 特定のスレッドIDがマッピングに含まれているか確認し、結果をログに出力する関数
+///
+/// # 引数
+/// * `target_id` - 確認するスレッドID
+/// * `mappings` - スレッドマッピングのハッシュマップ
+fn check_target_thread_exists(target_id: u64, mappings: &HashMap<Id<ChannelMarker>, ThreadInfo>) {
+    let id = Id::new(target_id);
+
+    mappings.get(&id).map_or_else(
+        || {
+            tracing::warn!(
+                "指定されたスレッドID {}のマッピングが見つかりません",
+                target_id
+            );
+        },
+        |info| {
+            tracing::info!(
+                "指定されたスレッドID {}のマッピングが見つかりました。ターゲットチャンネル: {}",
+                target_id,
+                info.target_channel_id
+            );
+        },
+    );
 }
 
 /// 環境変数からスレッドマッピング設定をパースする関数
@@ -34,49 +97,67 @@ struct ThreadInfo {
 fn parse_thread_mappings() -> HashMap<Id<ChannelMarker>, ThreadInfo> {
     // 環境変数の一覧をデバッグ出力
     tracing::debug!("環境変数の一覧:");
-    for (key, value) in env::vars() {
-        if key.starts_with("THREAD_MAPPING_") {
-            tracing::debug!("  環境変数: {}={}", key, value);
-        }
-    }
+    env::vars()
+        .filter(|(key, _)| is_thread_mapping_key(key))
+        .for_each(|(key, value)| log_thread_mapping_env(&key, &value));
 
     let thread_mappings = env::vars()
-        .filter(|(key, _)| key.starts_with("THREAD_MAPPING_"))
+        .filter(|(key, _)| is_thread_mapping_key(key))
         .filter_map(|(_, value)| parse_thread_mapping_entry(&value))
         .collect::<HashMap<_, _>>();
 
-    // マッピングの総数を出力
-    tracing::info!(
-        "読み込まれたスレッドマッピングの総数: {}",
-        thread_mappings.len()
-    );
-
-    // すべてのマッピングを出力
-    for (thread_id, info) in &thread_mappings {
-        tracing::info!(
-            "マッピング情報: スレッドID {} -> チャンネルID {}",
-            thread_id,
-            info.target_channel_id
-        );
-    }
+    // マッピングの総数と詳細を出力
+    log_thread_mappings_summary(&thread_mappings);
 
     // 特定のスレッドIDが含まれているか確認（ユーザー指定のIDをチェック）
-    let target_thread_id = 1_350_283_354_309_660_672_u64;
-    let id = Id::new(target_thread_id);
-    if thread_mappings.contains_key(&id) {
-        tracing::info!(
-            "指定されたスレッドID {}のマッピングが見つかりました。ターゲットチャンネル: {}",
-            target_thread_id,
-            thread_mappings.get(&id).unwrap().target_channel_id
-        );
-    } else {
+    check_target_thread_exists(1_350_283_354_309_660_672_u64, &thread_mappings);
+
+    thread_mappings
+}
+
+/// `エントリが有効なThreadMappingフォーマットかどうかをチェックする関数`
+///
+/// # 引数
+/// * `parts` - スプリットされたエントリ部分のベクター
+///
+/// # 戻り値
+/// * `bool` - フォーマットが正しい場合はtrue
+fn is_valid_thread_mapping_format(parts: &[&str]) -> bool {
+    !(parts.len() < 2 || parts.len() > 3)
+}
+
+/// スレッドIDとチャンネルIDをパースする関数
+///
+/// # 引数
+/// * `thread_id_str` - スレッドIDの文字列
+/// * `channel_id_str` - チャンネルIDの文字列
+///
+/// # 戻り値
+/// * `Option<(u64, u64)>` - パースに成功した場合は数値のタプル、失敗した場合はNone
+fn parse_ids(thread_id_str: &str, channel_id_str: &str) -> Option<(u64, u64)> {
+    let thread_id_result = thread_id_str.parse::<u64>();
+    let target_channel_id_result = channel_id_str.parse::<u64>();
+
+    if let Err(e) = &thread_id_result {
         tracing::warn!(
-            "指定されたスレッドID {}のマッピングが見つかりません",
-            target_thread_id
+            "スレッドIDのパースに失敗: {} - エラー: {}",
+            thread_id_str,
+            e
         );
     }
 
-    thread_mappings
+    if let Err(e) = &target_channel_id_result {
+        tracing::warn!(
+            "ターゲットチャンネルIDのパースに失敗: {} - エラー: {}",
+            channel_id_str,
+            e
+        );
+    }
+
+    match (thread_id_result, target_channel_id_result) {
+        (Ok(thread_id), Ok(channel_id)) => Some((thread_id, channel_id)),
+        _ => None,
+    }
 }
 
 /// 単一のスレッドマッピングエントリをパースする関数
@@ -90,7 +171,8 @@ fn parse_thread_mapping_entry(entry: &str) -> Option<(Id<ChannelMarker>, ThreadI
     tracing::debug!("スレッドマッピングエントリのパース: {}", entry);
 
     let parts: Vec<&str> = entry.split(':').collect();
-    if parts.len() < 2 || parts.len() > 3 {
+
+    if !is_valid_thread_mapping_format(&parts) {
         tracing::warn!(
             "不正なマッピングフォーマット: {}（形式は thread_id:channel_id[:all] である必要があります）",
             entry
@@ -98,23 +180,7 @@ fn parse_thread_mapping_entry(entry: &str) -> Option<(Id<ChannelMarker>, ThreadI
         return None;
     }
 
-    let thread_id_result = parts[0].parse::<u64>();
-    let target_channel_id_result = parts[1].parse::<u64>();
-
-    if let Err(e) = &thread_id_result {
-        tracing::warn!("スレッドIDのパースに失敗: {} - エラー: {}", parts[0], e);
-    }
-
-    if let Err(e) = &target_channel_id_result {
-        tracing::warn!(
-            "ターゲットチャンネルIDのパースに失敗: {} - エラー: {}",
-            parts[1],
-            e
-        );
-    }
-
-    let thread_id = thread_id_result.ok()?;
-    let target_channel_id = target_channel_id_result.ok()?;
+    let (thread_id, target_channel_id) = parse_ids(parts[0], parts[1])?;
 
     // 全メッセージ転送フラグをチェック
     let transfer_all_messages = parts.len() == 3 && parts[2] == "all";
@@ -178,6 +244,36 @@ fn format_attachments(attachments: &[twilight_model::channel::Attachment]) -> St
 
     tracing::debug!("添付ファイルURLをフォーマット: {}", urls);
     urls
+}
+
+/// 送信者情報、メッセージコンテンツ、添付ファイルから完全なメッセージコンテンツを作成する関数
+///
+/// # 引数
+/// * `author_name` - 送信者の名前
+/// * `content` - メッセージの内容
+/// * `attachments` - 添付ファイルのスライス
+///
+/// # 戻り値
+/// * フォーマット済みの完全なコンテンツ
+fn create_full_message_content(
+    author_name: &str,
+    content: &str,
+    attachments: &[twilight_model::channel::Attachment],
+) -> String {
+    let formatted_content = format_message_content(author_name, content);
+    let attachment_urls = format_attachments(attachments);
+    format!("{formatted_content}{attachment_urls}")
+}
+
+/// メッセージが通常のメッセージで、ボットからのものではないかを判定する関数
+///
+/// # 引数
+/// * `message` - 判定するメッセージ
+///
+/// # 戻り値
+/// * `bool` - 通常のユーザーメッセージの場合はtrue
+fn is_regular_user_message(message: &twilight_model::channel::Message) -> bool {
+    message.kind == MessageType::Regular && !message.author.bot
 }
 
 /// ボットの状態を管理する構造体
@@ -257,24 +353,24 @@ impl BotState {
 
         // マップ内のすべてのキーを表示（デバッグ用）
         tracing::debug!("マップ内のスレッドID一覧:");
-        for key in self.thread_mappings.keys() {
+        self.thread_mappings.keys().for_each(|key| {
             tracing::debug!("  マップ内のスレッドID: {}", key);
-        }
+        });
 
-        let thread_info = self.thread_mappings.get(&thread_id);
-
-        if let Some(info) = thread_info {
-            tracing::info!(
-                "スレッドID {}の情報が見つかりました: ターゲットチャンネル={}, 全メッセージ転送={}",
-                thread_id,
-                info.target_channel_id,
-                info.transfer_all_messages
-            );
-            Some(info)
-        } else {
-            tracing::warn!("スレッドID {}の情報が見つかりません", thread_id);
-            None
-        }
+        // スレッド情報を取得し、ログ出力
+        self.thread_mappings.get(&thread_id)
+            .inspect(|info| {
+                tracing::info!(
+                    "スレッドID {}の情報が見つかりました: ターゲットチャンネル={}, 全メッセージ転送={}",
+                    thread_id,
+                    info.target_channel_id,
+                    info.transfer_all_messages
+                );
+            })
+            .or_else(|| {
+                tracing::warn!("スレッドID {}の情報が見つかりません", thread_id);
+                None
+            })
     }
 
     /// スレッドID用のターゲットチャンネルを取得する
@@ -284,8 +380,10 @@ impl BotState {
     ///
     /// # 戻り値
     /// * `Option<Id<ChannelMarker>>` - ターゲットチャンネルIDが見つかった場合はSome、それ以外はNone
+    #[allow(dead_code)]
     fn get_target_channel(&self, thread_id: Id<ChannelMarker>) -> Option<Id<ChannelMarker>> {
-        self.get_thread_info(thread_id).map(|info| info.target_channel_id)
+        self.get_thread_info(thread_id)
+            .map(|info| info.target_channel_id)
     }
 
     /// メッセージをターゲットチャンネルに送信する
@@ -339,6 +437,73 @@ impl BotState {
             .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))
     }
 
+    /// チャンネルメッセージ取得を試行し、エラーならメッセージを送信して終了する
+    ///
+    /// # 引数
+    /// * `thread_id` - メッセージを取得するスレッドID
+    /// * `target_channel_id` - エラー報告先のチャンネルID
+    ///
+    /// # 戻り値
+    /// * `Result<Vec<twilight_model::channel::Message>>` - 取得したメッセージまたはエラー
+    async fn try_fetch_messages(
+        &self,
+        thread_id: Id<ChannelMarker>,
+        target_channel_id: Id<ChannelMarker>,
+    ) -> Result<Vec<twilight_model::channel::Message>> {
+        // メッセージ履歴を取得
+        let messages_result = self.http.channel_messages(thread_id).limit(100).await;
+
+        if let Err(e) = &messages_result {
+            tracing::error!("メッセージ履歴の取得に失敗: {}", e);
+            let error_message = format!("❌ メッセージ履歴の取得に失敗しました: {e}");
+            self.send_message_to_channel(target_channel_id, &error_message, thread_id)
+                .await?;
+            return Err(anyhow::anyhow!("Failed to fetch message history: {}", e));
+        }
+
+        // モデルを取得
+        let model_result = messages_result.unwrap().model().await;
+
+        if let Err(e) = &model_result {
+            tracing::error!("メッセージモデルの取得に失敗: {}", e);
+            let error_message = format!("❌ メッセージの処理に失敗しました: {e}");
+            self.send_message_to_channel(target_channel_id, &error_message, thread_id)
+                .await?;
+            return Err(anyhow::anyhow!("Failed to model messages: {}", e));
+        }
+
+        Ok(model_result.unwrap())
+    }
+
+    /// メッセージを転送する処理を実行
+    ///
+    /// # 引数
+    /// * `message` - 転送するメッセージ
+    /// * `target_channel_id` - 転送先チャンネルID
+    /// * `thread_id` - 元のスレッドID
+    ///
+    /// # 戻り値
+    /// * `Result<()>` - 処理結果
+    async fn transfer_single_message(
+        &self,
+        message: &twilight_model::channel::Message,
+        target_channel_id: Id<ChannelMarker>,
+        thread_id: Id<ChannelMarker>,
+    ) -> Result<()> {
+        // メッセージのフォーマット
+        let full_content = create_full_message_content(
+            &message.author.name,
+            &message.content,
+            &message.attachments,
+        );
+
+        tracing::debug!("転送するメッセージ内容: {}", full_content);
+
+        // メッセージを送信
+        self.send_message_to_channel(target_channel_id, &full_content, thread_id)
+            .await
+    }
+
     /// 指定されたスレッドの全メッセージを取得して転送する
     ///
     /// # 引数
@@ -358,72 +523,94 @@ impl BotState {
         );
 
         // 最初に転送準備中のメッセージを送信
-        let status_message = format!(
-            "🔄 このスレッドのメッセージを全て取得して転送しています..."
-        );
-        self.send_message_to_channel(target_channel_id, &status_message, thread_id)
+        let status_message = "🔄 このスレッドのメッセージを全て取得して転送しています...";
+        self.send_message_to_channel(target_channel_id, status_message, thread_id)
             .await?;
 
-        // メッセージ履歴を取得
-        let messages_result = self.http.channel_messages(thread_id).limit(100).await;
-        
-        if let Err(e) = &messages_result {
-            tracing::error!("メッセージ履歴の取得に失敗: {}", e);
-            let error_message = format!("❌ メッセージ履歴の取得に失敗しました: {}", e);
-            self.send_message_to_channel(target_channel_id, &error_message, thread_id)
-                .await?;
-            return Err(anyhow::anyhow!("Failed to fetch message history: {}", e));
-        }
-        
-        // メッセージを取得して処理
-        let messages = messages_result.unwrap().model().await.unwrap();
-        
-        tracing::info!("取得したメッセージ数: {}", messages.len());
+        // メッセージ履歴を取得して処理
+        let messages = self
+            .try_fetch_messages(thread_id, target_channel_id)
+            .await?;
+        let total_messages = messages.len();
+
+        tracing::info!("取得したメッセージ数: {}", total_messages);
 
         // 転送するメッセージの総数を通知
-        let total_messages = messages.len();
-        let info_message = format!("ℹ️ このスレッドから {} 件のメッセージを転送します", total_messages);
+        let info_message =
+            format!("ℹ️ このスレッドから {total_messages} 件のメッセージを転送します");
         self.send_message_to_channel(target_channel_id, &info_message, thread_id)
             .await?;
 
-        // 古い順に処理するため、リストを逆順にする
-        let reversed_messages = messages.iter().rev().collect::<Vec<_>>();
+        // メッセージを古い順から処理し、転送（フィルタリング、変換、送信をパイプラインで処理）
+        futures::future::try_join_all(
+            messages
+                .iter()
+                .rev() // 古い順にするため逆順に
+                .filter(|msg| is_regular_user_message(msg))
+                .map(|msg| {
+                    let target_id = target_channel_id;
+                    let src_id = thread_id;
+                    async move {
+                        // メッセージ転送
+                        self.transfer_single_message(msg, target_id, src_id).await?;
 
-        // 各メッセージを順番に転送
-        for message in reversed_messages {
-            // システムメッセージはスキップ
-            if message.kind == MessageType::Regular && !message.author.bot {
-                // メッセージのフォーマット
-                let content = format_message_content(&message.author.name, &message.content);
-                let attachment_urls = format_attachments(&message.attachments);
-                let full_content = format!("{content}{attachment_urls}");
+                        // レート制限を避けるために少し待機
+                        tokio::time::sleep(Duration::from_millis(500)).await;
 
-                tracing::debug!("転送するメッセージ内容: {}", full_content);
-
-                // ターゲットチャンネルにメッセージを送信
-                if let Err(e) = self
-                    .send_message_to_channel(target_channel_id, &full_content, thread_id)
-                    .await
-                {
-                    tracing::error!("メッセージの転送に失敗: {}", e);
-                    continue;
-                }
-
-                // レート制限を避けるために少し待機
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                }),
+        )
+        .await?;
 
         // 転送完了メッセージを送信
         let completion_message =
-            format!("✅ スレッドからの {} 件のメッセージの転送が完了しました", total_messages);
+            format!("✅ スレッドからの {total_messages} 件のメッセージの転送が完了しました");
         self.send_message_to_channel(target_channel_id, &completion_message, thread_id)
             .await?;
 
         tracing::info!("スレッド {} の全メッセージの転送が完了しました", thread_id);
         Ok(())
     }
-    
+
+    /// 受信したコマンドを処理する
+    ///
+    /// # 引数
+    /// * `command` - コマンド文字列
+    /// * `thread_info` - スレッド情報
+    /// * `thread_id` - スレッドID
+    ///
+    /// # 戻り値
+    /// * `Option<Result<()>>` - コマンドを処理した場合は結果、コマンドではない場合はNone
+    async fn handle_command(
+        &self,
+        command: &str,
+        thread_info: &ThreadInfo,
+        thread_id: Id<ChannelMarker>,
+    ) -> Option<Result<()>> {
+        let target_channel_id = thread_info.target_channel_id;
+        let trimmed_command = command.trim();
+
+        // コマンドを判別して適切な処理を行う
+        match trimmed_command {
+            "!all" => {
+                tracing::info!("「!all」コマンドを検出、全メッセージの転送を開始します");
+                Some(
+                    self.fetch_and_transfer_all_messages(thread_id, target_channel_id)
+                        .await,
+                )
+            }
+            "!start" if thread_info.transfer_all_messages => {
+                tracing::info!("全メッセージ転送設定が有効です。転送を開始します");
+                Some(
+                    self.fetch_and_transfer_all_messages(thread_id, target_channel_id)
+                        .await,
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// メッセージを処理する
     /// スレッドからのメッセージを対応するターゲットチャンネルにコピーします
     ///
@@ -476,22 +663,17 @@ impl BotState {
             target_channel_id
         );
 
-        // `!all` コマンドを受信した場合、全メッセージを転送
-        if msg.content.trim() == "!all" {
-            tracing::info!("「!all」コマンドを検出、全メッセージの転送を開始します");
-            return self.fetch_and_transfer_all_messages(msg.channel_id, target_channel_id).await;
-        }
-
-        // 設定で全メッセージ転送が指定されているかチェック
-        if thread_info.transfer_all_messages && msg.content.trim() == "!start" {
-            tracing::info!("全メッセージ転送設定が有効です。転送を開始します");
-            return self.fetch_and_transfer_all_messages(msg.channel_id, target_channel_id).await;
+        // コマンド処理を試みる
+        if let Some(result) = self
+            .handle_command(&msg.content, thread_info, msg.channel_id)
+            .await
+        {
+            return result;
         }
 
         // 通常のメッセージ処理
-        let content = format_message_content(&msg.author.name, &msg.content);
-        let attachment_urls = format_attachments(&msg.attachments);
-        let full_content = format!("{content}{attachment_urls}");
+        let full_content =
+            create_full_message_content(&msg.author.name, &msg.content, &msg.attachments);
 
         tracing::debug!("転送するメッセージ内容: {}", full_content);
 
@@ -544,6 +726,34 @@ fn get_discord_token() -> Result<String> {
     Ok(token)
 }
 
+/// イベントを処理する関数
+///
+/// # 引数
+/// * `event_result` - イベント結果
+/// * `shard_id` - シャードID
+///
+/// # 戻り値
+/// * `Option<Event>` - 処理すべきイベント、またはNone（ループを抜ける場合）
+fn process_event_result(
+    event_result: Option<Result<Event, twilight_gateway::error::ReceiveMessageError>>,
+    shard_id: ShardId,
+) -> Option<Event> {
+    match event_result {
+        Some(Ok(event)) => {
+            tracing::debug!("イベント受信: タイプ {:?}", event.kind());
+            Some(event)
+        }
+        Some(Err(e)) => {
+            tracing::error!("イベント受信中にエラーが発生: {}", e);
+            None
+        }
+        None => {
+            tracing::warn!("シャード {} のイベントストリームが終了しました", shard_id);
+            None
+        }
+    }
+}
+
 /// イベントループを実行する関数
 ///
 /// # 引数
@@ -559,32 +769,20 @@ async fn run_event_loop(mut shard: Shard, bot_state: Arc<Mutex<BotState>>) -> Re
         // 次のイベントを非同期に待機
         tracing::debug!("次のイベントを待機中...");
 
-        let event = match shard.next_event(EventTypeFlags::all()).await {
-            Some(Ok(event)) => {
-                tracing::debug!("イベント受信: タイプ {:?}", event.kind());
-                event
-            }
-            Some(Err(e)) => {
-                tracing::error!("イベント受信中にエラーが発生: {}", e);
-                continue;
-            }
-            None => {
-                tracing::warn!("イベントストリームが終了しました");
-                break;
-            }
-        };
+        let event_result = shard.next_event(EventTypeFlags::all()).await;
 
-        // 各イベント処理を別タスクで実行するためのボット状態のクローン
-        let bot_state_clone = Arc::clone(&bot_state);
+        // イベント結果を処理
+        if let Some(event) = process_event_result(event_result, shard.id()) {
+            // 各イベント処理を別タスクで実行するためのボット状態のクローン
+            let bot_state_clone = Arc::clone(&bot_state);
 
-        // イベント処理を別スレッドで実行
-        tokio::spawn(async move {
-            handle_event(event, bot_state_clone).await;
-        });
+            // イベント処理を別スレッドで実行
+            tokio::spawn(async move {
+                handle_event(event, bot_state_clone).await;
+            });
+        }
+        // エラーまたはNoneの場合はループの次のイテレーションへ
     }
-
-    tracing::info!("イベントループを終了します");
-    Ok(())
 }
 
 /// デバッグモードが有効かチェックする
