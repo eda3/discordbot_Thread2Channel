@@ -10,10 +10,15 @@ use tokio::time::Duration;
 
 // Discord APIとのインタラクションに必要なクレート
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
+use twilight_http::request::channel::message::CreateMessage;
 use twilight_http::Client as HttpClient;
+use twilight_model::channel::message::embed::{Embed, EmbedAuthor, EmbedField, EmbedFooter};
 use twilight_model::channel::message::MessageType;
+use twilight_model::channel::ChannelType;
 use twilight_model::gateway::payload::incoming::MessageCreate;
 use twilight_model::id::{marker::ChannelMarker, Id};
+use twilight_model::user::User;
+use twilight_model::util::Timestamp;
 
 /// スレッド情報を保持する構造体
 /// 各スレッドがメッセージをコピーする先のターゲットチャンネルIDと転送設定を格納します
@@ -490,18 +495,56 @@ impl BotState {
         target_channel_id: Id<ChannelMarker>,
         thread_id: Id<ChannelMarker>,
     ) -> Result<()> {
-        // メッセージのフォーマット
-        let full_content = create_full_message_content(
-            &message.author.name,
-            &message.content,
-            &message.attachments,
-        );
+        // 埋め込みメッセージを作成
+        let embed = MessageEmbedBuilder::new()
+            .with_author(&message.author)
+            .with_description(message.content.clone())
+            .with_color(calculate_color(message.author.id.get()))
+            .with_timestamp(message.timestamp);
 
-        tracing::debug!("転送するメッセージ内容: {}", full_content);
+        // 添付ファイルの処理
+        let embed = message
+            .attachments
+            .iter()
+            .fold(embed, |builder, attachment| {
+                builder.add_field(
+                    "添付ファイル".to_string(),
+                    format!("[{}]({})", attachment.filename, attachment.url),
+                    false,
+                )
+            });
 
-        // メッセージを送信
-        self.send_message_to_channel(target_channel_id, &full_content, thread_id)
+        // 埋め込みメッセージを送信
+        let embed = embed.build();
+
+        match self
+            .http
+            .create_message(target_channel_id)
+            .embeds(&[embed])
             .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    "メッセージを転送: スレッド {} -> チャンネル {} (埋め込み形式)",
+                    thread_id,
+                    target_channel_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("埋め込みメッセージの送信に失敗: {}", e);
+
+                // フォールバック: テキスト形式でメッセージを送信
+                let full_content = create_full_message_content(
+                    &message.author.name,
+                    &message.content,
+                    &message.attachments,
+                );
+
+                self.send_message_to_channel(target_channel_id, &full_content, thread_id)
+                    .await
+            }
+        }
     }
 
     /// 指定されたスレッドの全メッセージを取得して転送する
@@ -696,10 +739,64 @@ async fn handle_event(event: Event, bot_state: Arc<Mutex<BotState>>) {
                 msg.channel_id
             );
 
-            // メッセージ作成イベントの処理
-            if let Err(e) = bot_state.lock().await.handle_message(*msg).await {
-                tracing::error!("メッセージ処理中にエラーが発生: {}", e);
-            }
+            // メッセージ処理をスポーンして実行
+            let bot_state_clone = Arc::clone(&bot_state);
+            let msg_owned = *msg;
+            tokio::spawn(async move {
+                // ボット自身のメッセージは無視
+                if msg_owned.author.bot {
+                    return;
+                }
+
+                let state = bot_state_clone.lock().await;
+                let http = &state.http;
+
+                // スレッド内のメッセージかどうかを確認
+                if let Ok(channel_result) = http.channel(msg_owned.channel_id).await {
+                    if let Ok(channel) = channel_result.model().await {
+                        if channel.kind == ChannelType::PublicThread
+                            || channel.kind == ChannelType::PrivateThread
+                        {
+                            // スレッドマッピングに登録されているかチェック
+                            if let Some(thread_info) = state.get_thread_info(msg_owned.channel_id) {
+                                // コマンド処理のみ実行
+                                let target_channel_id = thread_info.target_channel_id;
+                                let content = msg_owned.content.trim();
+
+                                // コマンドかどうかチェック
+                                let is_all_command = content == "!all";
+                                let is_start_command =
+                                    content == "!start" && thread_info.transfer_all_messages;
+
+                                if is_all_command || is_start_command {
+                                    // 全メッセージ転送を実行
+                                    tracing::info!(
+                                        "コマンド「{}」を検出、全メッセージの転送を開始します",
+                                        content
+                                    );
+
+                                    // ロックを解放してから処理を行う（デッドロック防止）
+                                    drop(state);
+
+                                    // 新しいスコープで再度ロックを取得
+                                    let state = bot_state_clone.lock().await;
+                                    if let Err(e) = state
+                                        .fetch_and_transfer_all_messages(
+                                            msg_owned.channel_id,
+                                            target_channel_id,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!("全メッセージ転送に失敗: {}", e);
+                                    }
+                                }
+
+                                // 通常のメッセージ転送は実行しない
+                            }
+                        }
+                    }
+                }
+            });
         }
         Event::Ready(_) => {
             // ボット準備完了イベントの処理
@@ -833,7 +930,104 @@ async fn main() -> Result<()> {
         tracing::info!("デバッグモードが有効です");
     }
 
+    tracing::info!("埋め込みメッセージモードで起動しています");
+
     // イベントループを実行
     tracing::info!("イベントループを開始します...");
     run_event_loop(shard, bot_state).await
+}
+
+/// ユーザーIDから一意の色を生成する関数
+fn calculate_color(user_id: u64) -> u32 {
+    (user_id & 0xFFFFFF) as u32
+}
+
+/// 埋め込みメッセージの作成に使用する構造体
+#[derive(Debug)]
+struct MessageEmbedBuilder {
+    author: Option<EmbedAuthor>,
+    description: Option<String>,
+    color: Option<u32>,
+    timestamp: Option<Timestamp>,
+    fields: Vec<EmbedField>,
+    footer: Option<EmbedFooter>,
+}
+
+impl MessageEmbedBuilder {
+    fn new() -> Self {
+        Self {
+            author: None,
+            description: None,
+            color: None,
+            timestamp: None,
+            fields: Vec::new(),
+            footer: None,
+        }
+    }
+
+    fn with_author(mut self, user: &User) -> Self {
+        let avatar_url = if let Some(avatar_hash) = &user.avatar {
+            format!(
+                "https://cdn.discordapp.com/avatars/{}/{}.png",
+                user.id.get(),
+                avatar_hash
+            )
+        } else {
+            // デフォルトのアバターURLを使用
+            format!(
+                "https://cdn.discordapp.com/embed/avatars/{}.png",
+                (user.id.get() % 5) as u8 // ユーザーIDを5で割った余りでデフォルトアイコンを決定
+            )
+        };
+
+        self.author = Some(EmbedAuthor {
+            name: user.name.clone(),
+            icon_url: Some(avatar_url),
+            url: None,
+            proxy_icon_url: None,
+        });
+        self
+    }
+
+    fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    fn with_color(mut self, color: u32) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
+
+    fn add_field(mut self, name: String, value: String, inline: bool) -> Self {
+        self.fields.push(EmbedField {
+            name,
+            value,
+            inline,
+        });
+        self
+    }
+
+    fn build(self) -> Embed {
+        Embed {
+            author: self.author,
+            color: self.color,
+            description: self.description,
+            fields: self.fields,
+            footer: self.footer,
+            image: None,
+            kind: "rich".to_string(),
+            provider: None,
+            thumbnail: None,
+            timestamp: self.timestamp,
+            title: None,
+            url: None,
+            video: None,
+        }
+    }
 }
